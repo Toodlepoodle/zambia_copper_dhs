@@ -1,0 +1,249 @@
+# Test Suite README
+## Zambia Copper Paper Pipeline — Test Files
+
+This document describes every test file in the suite. All tests are written to run **without real DHS data files** — they use synthetic data generated on the fly. The only exceptions are the DTA integration tests in `test_untested.py`, which automatically skip themselves if the `.dta` source files aren't present on your machine.
+
+To run any file individually:
+```
+pytest test_<name>.py -v
+```
+Or run the whole suite at once:
+```
+pytest -v
+```
+
+---
+
+## `test_config_00.py`
+
+Tests the central configuration module (`config_00.py`), which is the single source of truth for every constant used across the pipeline. Nothing in the pipeline should hardcode a value that lives here, so this file is foundational — if these tests fail, everything downstream is suspect.
+
+**What it checks:**
+
+- **Paths** — `BASE_DIR` and `OUT_DIR` are proper `pathlib.Path` objects, and `OUT_DIR` lives inside `BASE_DIR` as expected.
+- **Copper prices** — All seven survey waves (1992, 1996, 2002, 2007, 2014, 2018, 2024) have an entry; every price is positive, numeric, within a plausible LME range ($500–$20,000/MT), and produces a finite natural log (needed for the Bartik instrument). The 2002 trough is confirmed as the lowest price, and 2007 is verified to be more than double it.
+- **Province harmonisation** — The lookup table maps every known raw province spelling (including all three variants of "North-Western" and the post-2011 "Muchinga" split) to exactly 9 canonical lowercase labels. Muchinga must map to "northern" and must not appear as an output value.
+- **Mining provinces** — Exactly two: `copperbelt` and `northwestern`. Both must be reachable via the harmonisation table.
+- **Wave files** — All seven waves define HR, IR, and KR file paths; MR is absent only for 1992 (correctly, since that survey had no Men's Recode). Every path is a string ending in `.dta` and contains its own survey year.
+- **DHS missing codes** — The set includes all standard single-, two-, three-, and four-digit flag codes (8, 9, 96, 97, 98, 99, 997–999, 9997–9999). Crucially, 0 and 1 are absent — both are valid responses.
+- **WASH classification codes** — `IMPROVED_WATER_CODES`, `IMPROVED_SANIT_CODES`, and `IMPROVED_FLOOR_CODES` are non-empty sets. Code 96 ("other/unknown") is absent from all of them, since classifying an unknown source as improved or unimproved would be a data error.
+- **Thresholds** — `MIN_OBS` and `MIN_CLUSTERS` are positive integers within sensible bounds (at least 10 obs; fewer than 9 clusters, since the panel only has 9 provinces).
+- **Cross-constant consistency** — `COPPER_PRICES` and `WAVE_FILES` cover exactly the same set of years; the Bartik instrument `mining × ln(price)` produces a finite float for every wave and every mining status.
+
+---
+
+## `test_00_audit_waves.py`
+
+Tests `00_audit_waves.py`, the exhaustive variable discovery script that scans every DHS file and reports what's actually in it before any cleaning happens. This is a diagnostic tool, not a data processor, so the tests focus on its utility functions rather than its output.
+
+**What it checks:**
+
+- **`resolve_path()`** — Case-insensitive recursive path resolution for finding `.dta` files across Windows/Linux inconsistencies. Verified to work with multi-level paths, exact matches, uppercase directories, and to return `None` gracefully for anything missing.
+- **`find_col()`** — Finds the first matching DHS column name from a priority list, case-insensitively. Returns `None` when nothing matches, and always returns the lowercase form of the column name.
+- **`detect_type()`** — Auto-detects whether a variable is categorical or continuous. Variables with value labels are categorical; float series without labels are continuous; integer series with few unique values are categorical, while those with many are continuous. Explicit overrides (`"cat"` or `"cont"`) are always respected.
+- **`analyse_variable()`** — Core diagnostic function. Verified to return the expected dictionary keys, calculate `n_total`, `n_valid`, and `pct_miss` correctly, flag a column as usable/unusable based on the `USABLE_THRESHOLD`, strip DHS flag codes (like 9999) before computing statistics, and produce descriptive detail strings containing `mean=` and `sd=` for continuous variables or `%` breakdowns for categorical ones.
+- **`VARIABLE_GROUPS`** — The master list of variables the audit script looks for. Each entry must have exactly 5 fields, use a valid file type (`HR`, `KR`, `IR`, etc.), use a valid `var_type`, have a non-empty candidate list, and have unique standard names within its group.
+- **End-to-end on synthetic data** — `analyse_variable` is run across a realistic simulated KR dataset, checking that flagged values (e.g. 9999 for Z-scores) don't contaminate computed means, and that the usability flag is always consistent with the threshold.
+- **`WAVE_FILES` in the audit module** — Confirms the audit script tracks all 7 waves and also looks at BR and PR files that the main pipeline scripts skip.
+
+---
+
+## `test_01_inspect_variables.py`
+
+Tests `01_inspect_variables.py`, a pre-panel inspection script that goes one step deeper than the audit — it's aware of known data quality issues like coding drift across waves, unit shifts in breastfeeding duration, and WASH source classifications.
+
+**What it checks:**
+
+- **`usability_flag()`** — Returns `"OK"`, `"WEAK"`, or `"UNUSABLE"` based on the percentage of missing values, with `BASIC_USABLE_THRESHOLD` and `RESEARCH_USABLE_THRESHOLD` defining the boundaries. Verified that BASIC < RESEARCH (research is stricter) and that the thresholds produce the right labels at the boundary.
+- **`get_labels()`** — Extracts a value-label dictionary from metadata. Returns an empty dict gracefully when the column doesn't exist, when metadata is `None`, or when the metadata object lacks the expected attribute.
+- **`inspect_var()`** — The main inspection function. Produces non-empty output, includes the variable name, shows usability flags, emits "CODING DRIFT" warnings for variables with known cross-wave inconsistencies (e.g. `m4`/`ever_breastfed` pre-2018), skips those warnings when the wave is fine, shows statistics for continuous variables, correctly flags nearly-all-missing columns, reports flagged Z-score values (`hw70 > 9990`), runs plausibility checks on months breastfed, and detects improved vs unimproved water sources.
+- **`load_file()`** — Returns `(None, None, error_string)` for non-existent files without crashing.
+- **`HARMONIZATION_WARNINGS`** — Dictionary keyed by `(variable_name, wave)` tuples. Checks that all 7 waves are covered for `sought_treatment`, that `ever_breastfed` 1992 carries a CODING DRIFT warning, that 2018 is marked OK, and that `months_bf` 2018 flags a UNIT SHIFT.
+- **`VARS_TO_INSPECT`** — Structure validation: HR, KR, and IR all present; `province` and `survey_weight` defined for every file type; all candidate lists are non-empty.
+- **WASH code dictionaries** — `IMPROVED_WATER` and `IMPROVED_SANIT` contain the canonical codes (10/11 for piped water, 11 for flush sewer), 96/99 are absent, and there's no overlap between improved and unimproved water.
+- **No-crash tests** — Every HR, KR, and IR variable in `VARS_TO_INSPECT` is run through `inspect_var()` on synthetic data without raising an exception.
+
+---
+
+## `test_02_build_panel.py`
+
+Tests `02_build_panel.py`, the main data construction script that reads raw DHS `.dta` files and produces a clean province-level panel dataset. This is the most data-critical file in the pipeline, so its tests are the most thorough about missing-code handling.
+
+**What it checks:**
+
+- **`to_num()`** — Coerces any series to float, turning non-numeric strings and `None` into `NaN`.
+- **`flag_nan()`** — Replaces values above a threshold (default 9990) with `NaN`. Used to handle DHS flag codes like 9999 for Z-scores and 9991 for haemoglobin.
+- **`harmonise()`** — The province harmonisation function. All variants of "Muchinga", "North-Western", "Northwestern", etc. must resolve correctly. Unknown province names must raise `ValueError`. The full mapping produces exactly 9 unique outputs.
+- **`is_mining()`** — Returns 1 for `copperbelt` and `northwestern`, 0 for everything else. All nine provinces are tested.
+- **`binary()`** — Creates binary (0/1) variables from DHS codes. Confirmed that all standard DHS missing codes (8, 9, 96, 97, 98, 99, etc.) produce `NaN` — not 0 — and that unlisted codes also become `NaN`. Tests a vaccination card scenario (codes 1 and 2 both mean "vaccinated") and urban/rural coding.
+- **`safe_recode()`** — Maps values through a lookup dictionary while forcing all DHS missing codes and flag values above the threshold to `NaN`. Tests the ever-breastfed coding specifically: `m4=93` ("stopped, still breastfeeding") must map to 1 ("ever breastfed"), and `m4=94` must map to 0 for the 2018+ coding era.
+- **`isin_vec()`** — Classifies observations by membership in a set (e.g. improved water codes). DHS missing codes 96 and 99 must become `NaN`, not 0 — misclassifying "other/unknown" as "unimproved" is a documented bug this test explicitly guards against.
+- **`wt_mean()`** — Weighted mean with proper handling of NaN values, zero weights, and fully-missing inputs.
+- **`collapse()`** — Aggregates individual-level data to province means using survey weights. Verified to produce correct province names, correct weighted means, and correct observation counts. Tests the case of a missing outcome column (should give `NaN`, not crash) and that 9 provinces produce 9 rows.
+- **Data quality end-to-end** — Additional checks on Muchinga/Northern equivalence, the 9-province count after merging, correct mining province identification, full vaccination requiring all 4 components, `sought_treatment` being `NaN` for healthy children, months-breastfed capped at 36, BMI plausibility range, wealth quintile range, haemoglobin division by 10, ANC 98/99 as `NaN`, crowding being `NaN` when rooms = 0, all 7 copper price waves present, Bartik computability, `post_priv` coding, and period labelling.
+
+---
+
+## `test_03_regressions.py`
+
+Tests `03_regressions.py`, which loads the raw DHS files, constructs the individual-level panel, and runs the main difference-in-differences regressions using a Bartik (shift-share) instrument.
+
+**What it checks:**
+
+- **`stars()`** — Significance star formatter: `***` for p < 0.01, `**` for p < 0.05, `*` for p < 0.10, empty string otherwise. `NaN` returns empty.
+- **`ols_cluster()`** — Custom OLS with cluster-robust standard errors (CR1S). Verified to return 4 arrays of the right length, produce non-negative standard errors, recover the known slope in a simulation (β ≈ 2.0), keep p-values in [0, 1], and not crash on perfectly collinear input (uses pseudoinverse as fallback).
+- **`demean_by_fast()`** — Fast group-mean subtraction via numpy. Tested on 1D and 2D arrays, confirmed to remove group means correctly and preserve output shape and dtype.
+- **`within_demean()`** — Two-way fixed effects demeaning via the alternating projections algorithm. Tested for convergence on constant arrays, near-zero group means after demeaning, 2D support, and correct behavior at `max_iter=1`.
+- **`run_one()`** — OLS with province dummies (the less preferred but faster estimator). Returns `None` below `MIN_OBS`, otherwise a dict with all expected keys. `coef_s = coef × scale` is verified exactly.
+- **`run_one_fe()`** — Two-way FE estimator (the preferred main specification). Returns all expected keys including `ci_lo`, `ci_hi`, and `r2`; SE is positive; CI bounds are ordered; returns `None` for missing columns or insufficient data; detects the known positive treatment effect in a simulation with n_per_cell=100.
+- **`OUTCOME_TABLES`** — Six tables, each with valid entries of 4 fields. `scale` is numeric, `higher_better` is boolean. Mortality outcomes (`u5_dead`, `infant_dead`, `neonatal_dead`) must have `higher_better=False`. No duplicates within a table. Table 1 contains `asset_index`, Table 2 contains `u5_dead`.
+- **Shared helpers** — Confirms that the `binary()`, `isin_vec()`, `safe_recode()`, and `flag_nan()` functions in this module agree with `config_00` on missing codes. Explicitly tests the two coding fixes: `h11=2` must be "sick" (not unset), and `m4=93` must be "ever breastfed" (not "never").
+- **`MIN_OBS` guard** — Confirmed to match the value from `config_00`, and `run_one_fe` returns `None` for data below it.
+
+---
+
+## `test_04_robustness.py`
+
+Tests `04_robustness.py`, which implements wild cluster bootstrap inference, event study regressions, and continuous robustness checks. This is the most statistically complex module in the pipeline.
+
+**What it checks:**
+
+- **`WEBB_WEIGHTS`** — The six Webb (2023) bootstrap weights. Verified to be exactly `{±√(1/2), ±√(2/2), ±√(3/2)}`, symmetric around zero, and all non-zero.
+- **`demean_by_fast()` and `within_demean()`** — Independent copies of the same algorithms from `03_regressions.py`. Cross-module consistency is verified numerically: both implementations must produce identical output on the same input (tolerance 1e-12).
+- **`prep_arrays()`** — Prepares demeaned arrays for OLS. Returns a 7-tuple or `None`. Tested to return `None` for missing columns, insufficient observations, and zero-variance treatment (which would cause a singular matrix).
+- **`ols_fe()`** — OLS on pre-demeaned data. Returns `(coef, resid, XXinv)`. Slope recovers the true value, residuals have near-zero mean, and singular matrices are handled via pseudoinverse.
+- **`clustered_se()`** — Computes cluster-robust standard errors given pre-computed residuals and `(X'X)⁻¹`. Returns an array of non-negative values.
+- **`wild_bootstrap_pval()`** — Wild cluster bootstrap p-value using Webb weights. Returns a float in [0, 1]; is reproducible with the same seed; tends toward low p-values for a known strong true effect (β = 10, tiny noise); and doesn't systematically reject under the null.
+- **`ascii_event_chart()`** — Renders an ASCII text chart of event study coefficients. Returns a string containing the outcome name, base wave year (2002), and the survey years. Returns a "No data" message for unknown outcomes.
+- **`FOCUS_OUTCOMES`** — Non-empty dict with 3-field entries `(ftype, controls, scale)`; all file types are valid; all scales are positive.
+- **`WAVE_ORDER` and `BASE_WAVE`** — Sorted 7-element list; base wave (2002) is in the list.
+
+---
+
+## `test_05_mechanisms.py`
+
+Tests `05_mechanisms.py`, which runs heterogeneity analyses, privatisation splits, dose-response models, and other mechanism checks building on the main regression results.
+
+**What it checks:**
+
+- **`demean_by_fast()` and `within_demean()`** — Third independent copy. Cross-module consistency verified against `03_regressions.py` on the same random input, with matching convergence iteration count.
+- **`_ols_clustered()`** — Internal OLS+cluster SE function (takes pre-demeaned arrays directly). Returns a 4-tuple; recovers slope correctly; SE non-negative; residuals near zero mean; pseudoinverse fallback on singular matrices.
+- **`_prep_and_demean()`** — Prepares data for the mechanisms estimator. Returns `None` for missing columns, insufficient data, zero-variance treatment, and fewer than 5 province clusters (the `MIN_CLUSTERS` guard).
+- **`run_fe()`** — The main estimator for this module. Returns all expected keys; p-values in [0, 1]; `coef_s = coef × scale`; R² in [0, 1]. Tested on full sample, urban-only, rural-only, pre-privatisation (1992/1996), and post-privatisation (2007–2024) subsamples. Returns `None` for missing outcome.
+- **`run_multi_fe()`** — Multi-treatment version. Returns a 5-tuple `(coef, se, pval, n, G)` where `coef` length equals the number of treatment variables specified.
+- **`slim()`** — Keeps only the columns needed for a regression, dropping everything else. Returns a DataFrame.
+- **`MINING_DOSE`** — Province-level continuous mining intensity (share of workforce in mining). All nine provinces have an entry; all doses are in (0, 1]; Copperbelt has the highest dose; Northwestern is second; all non-mining provinces have doses < 5%.
+- **Privatisation constants** — `PRE_PRIV_WAVES = {1992, 1996}` and `POST_PRIV_WAVES = {2007, 2014, 2018, 2024}`. Crucially, **2002 is absent from both** — it's the boundary year and including it in either sample would contaminate the pre/post comparison.
+- **Data quality** — Non-mining province doses are verified to be low; full-sample and urban-only regressions must both complete without crashing; convergence behavior is identical across module copies.
+
+---
+
+## `test_06_figures.py`
+
+Tests `06_figures.py`, the publication figure generation script. Rather than comparing pixel values, these tests check that all the mathematical and structural decisions baked into the figures are correct — and that the figures actually render to disk without errors.
+
+**What it checks:**
+
+- **`_stars()`** — Same significance formatter as in other modules; tested independently here.
+- **`T_CRIT_95`** — The t-critical value used to draw 95% confidence interval bars. With G=9 provinces, degrees of freedom = G−1 = 8. The test confirms `T_CRIT_95 = scipy.stats.t.ppf(0.975, df=8) ≈ 2.306`, not the normal approximation 1.96. This matters: if you accidentally use 1.96, your confidence intervals will be too narrow.
+- **`WAVES` and `CU_PRICES`** — 7 elements each; waves sorted; 2002 is the lowest-price trough; 2007 is more than double 2002.
+- **Colour constants** — `C_MINING`, `C_NONMINING`, `C_URBAN`, `C_RURAL`, `C_SIG`, `C_INSIG` are all valid 7-character hex strings starting with `#`. Significant and insignificant colours are distinct.
+- **`fig_copper_price()`** — The LME copper price trend figure. Runs without exception and saves both `.pdf` and `.png` to the output directory.
+- **`fig_coef_plot()`** — The main coefficient plot. Runs without exception on a synthetic `ind_results.csv`. Critically, all outcomes are shown regardless of p-value — an earlier bug filtered to p < 0.10 only, which would have hidden null results.
+- **`save()`** — Saves a matplotlib figure as both PDF and PNG, then closes it so figures don't accumulate in memory.
+- **CI computation** — Algebraic checks that `CI = coef ± T_CRIT_95 × se` produces properly ordered, symmetric, correctly-width intervals; and that significance is consistent between the t-test p-value and whether the CI excludes zero.
+- **`rcParams`** — Font family is serif; grid alpha is 0.3; top and right spines are disabled (standard academic figure style).
+- **Event study DataFrame** — Structural checks on the event study data format: base wave (2002) has beta=0 and p=NaN; 7 rows per outcome; `ci_lo ≤ ci_hi` everywhere.
+
+---
+
+## `test_mens_migration.py`
+
+Tests `mens_migration.py`, a standalone robustness check that reruns key regressions on a subsample of men who are long-term residents of their current province. This addresses the migration concern: if mining booms attract migrants from other provinces, the treatment group composition changes over time, potentially biasing the estimates.
+
+**What it checks:**
+
+- **`demean_by_fast()` and `within_demean()`** — Fourth independent copy. Verified numerically consistent with the implementation in `03_regressions.py`.
+- **`run_fe()`** — Same estimator as in `05_mechanisms.py`. All expected keys present; p-values in [0, 1]; SE positive; `coef_s = coef × scale`; returns `None` for missing column, zero-variance treatment, or insufficient data; runs on all 6 men's outcomes without crashing.
+- **`mv104` coding logic** — `mv104` is the DHS variable for "years of residence in current place." The long-resident filter (`longres`) must code men correctly: 0–4 years → not long-resident; ≥5 years → long-resident; code 95 ("always lived here") → long-resident; codes 96 ("visitor") and 97 ("not stated") → `NaN` (excluded from analysis). Each of these cases is tested individually.
+- **Long-resident subsample** — Using a synthetic panel with realistic `mv104` distributions, verifies that the proportion of long-residents is plausible (10–95%), that visitors are excluded, that `run_fe()` runs on both the full sample and the long-resident subsample, and that both produce finite coefficient estimates.
+- **`build_table()`** — The table builder that compares full-sample vs long-resident coefficients and labels results as "CONSISTENT", "WEAKENED", or "REVERSED". Tested to produce non-empty output, include all outcome labels, handle an empty input DataFrame gracefully (with a "NO RESULTS" message), and correctly label a forced-significant result.
+- **`MEN_OUTCOMES`** — 6 entries, each with exactly 4 fields `(var, label, scale, controls)`. All scales positive; all controls are lists; `man_employed` and `man_dv_justify` are present; `man_age` appears in every control list.
+- **Constants** — `MV104_COL = "mv104"`, `LONGRES_YEARS = 5`, `ALWAYS_CODE = 95`, `EXCLUDE_CODES = {96, 97}`; `MIN_OBS` and `MIN_CLUSTERS` match `config_00`.
+
+---
+
+## `test_untested.py`
+
+A catch-all test file for every function not already covered by the files above. It plugs the gaps left by the module-specific test files, particularly for functions that deal with raw data loading, column lookup helpers, and the full end-to-end pipeline orchestration. It also contains the real DTA integration tests (which skip automatically when files are absent).
+
+**Coverage:**
+
+**From `02_build_panel.py`:**
+- **`col()`** — Finds the first present column from a candidate list, case-insensitively. Returns `None` when nothing matches.
+- **`check_weights()`** — Appends a "WARN" message to a checks list if survey weights are skewed (max/mean > 5×). No warning for uniform weights, no crash for all-NaN weights.
+- **`get_label()`** — Converts a numeric province code to its lowercase string label using pyreadstat metadata. Falls back to the string representation of the code if the label is missing.
+- **`prov_labels()`** — Attaches a `province_name` column to a DataFrame by looking up the province code. Applies the Muchinga→Northern merge. All output labels are lowercase.
+- **`collapse()`** edge cases — Zero-weight provinces give `NaN`; `rooms_sleep=0` gives `NaN` for crowding (not infinity); missing outcome columns give `NaN`.
+- **`load()`** — Reads a `.dta` file and lowercases all column names. Returns a `(DataFrame, meta)` tuple.
+- **Period function** — The `period()` helper that assigns a commodity cycle label (`pre_boom`, `boom`, `bust`, `recovery`) to each survey wave. All 7 waves tested.
+- **Panel instrument construction** — Tests that `mining`, `ln_cu_price`, `bartik`, `post_priv`, and province dummies are computed correctly on a synthetic mini-panel.
+
+**From `03_regressions.py`:**
+- **`harmonise_prov()`** — Province name harmonisation in the regression module. Same as `harmonise()` in the panel module; tested independently.
+- **`get_label()`** — Same as the build_panel version; independent copy.
+- **`build_hr()`** — Builds the household-level variables from raw HR data. Tests that `asset_index` is in [0, 1]; `improved_water` is binary or NaN; `urban` is binary; `wealth_q` is 1–5; `clean_fuel` is binary. Also verifies that code 96 in `hv201` produces `NaN` (not 0) for `improved_water`.
+- **`build_kr()`** — Kids recode builder. Tests `u5_dead` is binary, `vacc_full` requires all 4 vaccines, `had_diarrhoea` code 2 is "sick", `ever_breastfed` with `m4=93` is 1 ("ever"), `urban` is binary, `child_age` is present.
+- **`build_ir()`** — Individual recode builder. Tests `anc_4plus`, `delivery_facility`, `modern_contra`, `edu_secondary_p` are all binary or NaN; `age_woman` is present; `married` is binary; doesn't crash on minimal input.
+- **`build_mr()`** — Men's recode builder. Tests `man_employed`, `man_edu_sec_p`, `man_multi_part` are binary or NaN; `man_age` is present.
+- **`run_table()`** — Runs regressions for a whole table of outcomes. Appends result rows with the right keys; skips gracefully when passed `None` data; skips missing outcome columns; produces results for all valid specs (`main`, `post_priv`, `pre_priv`, `boom_2007`, `balanced`).
+- **`load_stack()`** — Loads and stacks all available waves for a given file type. Returns `None` and logs "NOT FOUND" when files are missing; attaches `bartik` and `province` columns; drops raw DHS column names from the output.
+
+**From `06_figures.py`:**
+- **`fig_event_maternal()`** — Event study plot for maternal health outcomes. Runs without exception on synthetic data; saves at least one output file.
+- **`fig_event_child()`** — Event study plot for child health outcomes.
+- **`fig_urban_rural()`** — Heterogeneity figure comparing urban and rural coefficients.
+- **`fig_privatisation()`** — Pre/post privatisation comparison figure.
+- **`fig_raw_trends()`** — Raw outcome trends figure. Accepts an empty datasets dict without crashing.
+
+**Data quality cross-checks:**
+- `hv201=96` in HR → `NaN` in `improved_water` (not 0)
+- `hv205=99` in HR → `NaN` in `improved_sanit`
+- `h2=8` (DK) in KR → `NaN` in `vacc_bcg` (not 0)
+- `m14_1 ∈ {98, 99}` in IR → `NaN` in `anc_4plus`
+- Home delivery codes (10–19) → `delivery_facility = 0`
+- Facility delivery codes (20–39) → `delivery_facility = 1`
+- Healthy children (h22=0, h31=0) → `sought_treatment = NaN`
+
+**DTA integration tests (auto-skipped without files):**
+- `TestProcessHrDta` — 9 provinces, valid province names, no Muchinga, `improved_water` in [0,1], `asset_index` in [0,1], plausible urban share, NaN wealth quintile for 1992.
+- `TestProcessKrDta` — Plausible U5 mortality, valid vaccination rates, `months_bf = NaN` for 2018 and 2024 (unit shift exclusion).
+- `TestProcessIrDta` — Plausible facility delivery rate, `edu_secondary_p` and `anc_4plus` in [0,1].
+- `TestProcessMrDta` — `man_employed` in [0,1], 9 provinces, 1992 MR correctly absent.
+- `TestDtaCrossWave` — Province sets consistent across all available HR waves; no Muchinga in any wave; improved water access doesn't dramatically fall over time; Copperbelt is (roughly) the most urban province.
+- `TestBuildPanelMainDta` and `TestRegressionMainDta` — Full end-to-end runs of `main()` in both modules, verifying CSV outputs, correct row counts (63 = 9 × 7), and structural validity of regression results.
+
+---
+
+## Running the tests
+
+**Requirements:** `pytest`, `numpy`, `pandas`, `scipy`, `matplotlib`. The main pipeline also needs `pyreadstat` to read `.dta` files, but the tests mock that dependency and will run fine without it.
+
+```bash
+# Run all tests
+pytest -v
+
+# Run a specific file
+pytest test_config_00.py -v
+
+# Run a specific test class
+pytest test_03_regressions.py::TestRunOneFe -v
+
+# Run with DTA integration tests (requires real DHS files)
+ZAMBIA_BASE_DIR=/path/to/your/data pytest test_untested.py -v
+
+# Skip slow DTA integration tests
+pytest -v -k "not Dta and not Main"
+```
+
+No test requires writing to disk (except `test_06_figures.py`, which uses `tempfile` for all file I/O). No test requires internet access. All tests clean up after themselves.
